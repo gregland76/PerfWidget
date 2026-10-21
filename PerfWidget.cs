@@ -5,6 +5,7 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
@@ -16,6 +17,10 @@ namespace PerfWidget
         public const byte AC_SRC_ALPHA = 0x01;
         public const int WS_EX_LAYERED = 0x00080000;
         public const int WS_EX_TOOLWINDOW = 0x00000080;
+        public const int VK_CONTROL = 0x11;
+
+        [DllImport("user32.dll")]
+        public static extern short GetAsyncKeyState(int vKey);
 
         [DllImport("user32.dll")]
         public static extern bool UpdateLayeredWindow(IntPtr hWnd, IntPtr hdcDst,
@@ -61,8 +66,14 @@ namespace PerfWidget
 
     public class PerfWidget : Form
     {
-        private const int LogicalW = 300;
-        private const int LogicalH = 32;
+        private const int HorizontalPanelW = 396;
+        private const int HorizontalPanelH = 28;
+        private const int VerticalPanelW = 140;
+        private const int VerticalPanelH = 104;
+        private const int ShadowGap = 4;
+        private const float CornerRadius = 14f;
+        private const int HoverPollInterval = 60;
+        private const int HoverReleaseMargin = 12;
 
         private static readonly Color Green = Color.FromArgb(61, 220, 132);
         private static readonly Color Amber = Color.FromArgb(255, 193, 7);
@@ -74,6 +85,9 @@ namespace PerfWidget
         private float cpuVal = -1f;
         private float ramVal = -1f;
         private float diskVal = -1f;
+        private float batteryPct = -1f;
+        private int batterySeconds = -1;
+        private bool batteryOnAC;
 
         private Bitmap canvas;
         private Graphics gfx;
@@ -85,8 +99,27 @@ namespace PerfWidget
         private bool dragging;
         private Point dragOffset;
 
+        private bool verticalLayout;
+        private readonly System.Collections.Generic.List<ToolStripMenuItem> layoutItems =
+            new System.Collections.Generic.List<ToolStripMenuItem>();
+        private readonly System.Collections.Generic.List<ToolStripMenuItem> startupItems =
+            new System.Collections.Generic.List<ToolStripMenuItem>();
+
+        private static string LayoutMenuText(bool vertical)
+        {
+            return vertical
+                ? "Passer en disposition en ligne"
+                : "Passer en disposition en colonne";
+        }
+
+        private int PanelWidth { get { return verticalLayout ? VerticalPanelW : HorizontalPanelW; } }
+        private int PanelHeight { get { return verticalLayout ? VerticalPanelH : HorizontalPanelH; } }
+        private int LogicalW { get { return PanelWidth + ShadowGap; } }
+        private int LogicalH { get { return PanelHeight + ShadowGap; } }
+
         private Timer timer;
-        private ContextMenuStrip widgetMenu;
+        private Timer hoverTimer;
+        private bool hiddenByHover;
         private NotifyIcon trayIcon;
         private Icon appIcon;
 
@@ -101,6 +134,8 @@ namespace PerfWidget
             using (Graphics g = Graphics.FromHwnd(IntPtr.Zero))
                 scale = g.DpiX / 96f;
 
+            LoadSettings();
+
             int w = (int)(LogicalW * scale);
             int h = (int)(LogicalH * scale);
             Size = new Size(w, h);
@@ -112,8 +147,10 @@ namespace PerfWidget
             valueFont = new Font("Segoe UI", 7f, FontStyle.Bold, GraphicsUnit.Point);
 
             InitCounters();
-            BuildWidgetMenu();
             BuildTrayIcon();
+            StartHoverWatcher();
+
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
 
             timer = new Timer();
             timer.Interval = 1000;
@@ -139,6 +176,12 @@ namespace PerfWidget
             }
         }
 
+        protected override bool ShowWithoutActivation
+        {
+            // The widget must never steal the focus from the window underneath.
+            get { return true; }
+        }
+
         protected override void OnPaintBackground(PaintEventArgs e) { }
 
         protected override void OnPaint(PaintEventArgs e) { }
@@ -146,7 +189,7 @@ namespace PerfWidget
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Left)
+            if (e.Button == MouseButtons.Left && CtrlDown)
             {
                 dragging = true;
                 dragOffset = e.Location;
@@ -159,7 +202,7 @@ namespace PerfWidget
             if (dragging)
             {
                 Point cur = Cursor.Position;
-                Location = new Point(cur.X - dragOffset.X, cur.Y - dragOffset.Y);
+                Location = ClampToWorkingArea(new Point(cur.X - dragOffset.X, cur.Y - dragOffset.Y));
             }
         }
 
@@ -168,14 +211,14 @@ namespace PerfWidget
             base.OnMouseUp(e);
             if (e.Button == MouseButtons.Left)
                 dragging = false;
-            else if (e.Button == MouseButtons.Right)
-                widgetMenu.Show(this, e.Location);
         }
 
         protected override void OnFormClosed(FormClosedEventArgs e)
         {
             base.OnFormClosed(e);
+            Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
             if (timer != null) { timer.Stop(); timer.Dispose(); }
+            if (hoverTimer != null) { hoverTimer.Stop(); hoverTimer.Dispose(); }
             if (trayIcon != null) { trayIcon.Visible = false; trayIcon.Dispose(); }
             if (appIcon != null) appIcon.Dispose();
             if (cpu != null) cpu.Dispose();
@@ -204,14 +247,318 @@ namespace PerfWidget
             try { pc.NextValue(); } catch { }
         }
 
-        private void BuildWidgetMenu()
+        private static bool CtrlDown
         {
-            widgetMenu = new ContextMenuStrip();
-            widgetMenu.Items.Add("Minimiser dans la barre d'état", null, delegate { MinimizeToTray(); });
-            widgetMenu.Items.Add(new ToolStripSeparator());
-            widgetMenu.Items.Add("À propos", null, delegate { ShowAbout(); });
-            widgetMenu.Items.Add(new ToolStripSeparator());
-            widgetMenu.Items.Add("Fermer", null, delegate { Application.Exit(); });
+            // GetAsyncKeyState is required here: the widget is never the foreground
+            // window, so Control.ModifierKeys would not reflect the real key state.
+            get { return (Native.GetAsyncKeyState(Native.VK_CONTROL) & 0x8000) != 0; }
+        }
+
+        private void StartHoverWatcher()
+        {
+            hoverTimer = new Timer();
+            hoverTimer.Interval = HoverPollInterval;
+            hoverTimer.Tick += delegate { UpdateHoverVisibility(); };
+            hoverTimer.Start();
+        }
+
+        private void UpdateHoverVisibility()
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+
+            Point cursor = Cursor.Position;
+
+            if (!Visible)
+            {
+                if (!hiddenByHover) return;
+
+                // While Ctrl is held the widget is revealed so it can be dragged;
+                // otherwise it only comes back once the pointer has clearly left it.
+                if (!CtrlDown && HoverZone.Contains(cursor)) return;
+
+                hiddenByHover = false;
+                Visible = true;
+                RefreshValues();
+                Render();
+                return;
+            }
+
+            if (dragging || CtrlDown) return;
+
+            if (Bounds.Contains(cursor))
+            {
+                hiddenByHover = true;
+                Visible = false;
+            }
+        }
+
+        private Rectangle HoverZone
+        {
+            get
+            {
+                Rectangle zone = Bounds;
+                int margin = (int)(HoverReleaseMargin * scale);
+                zone.Inflate(margin, margin);
+                return zone;
+            }
+        }
+
+        private ToolStripMenuItem BuildLayoutItem()
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem(LayoutMenuText(verticalLayout), null,
+                delegate { SetVerticalLayout(!verticalLayout); });
+
+            layoutItems.Add(item);
+            return item;
+        }
+
+        private void SetVerticalLayout(bool vertical)
+        {
+            if (verticalLayout == vertical) return;
+
+            verticalLayout = vertical;
+            SyncLayoutTexts();
+            ApplyLayout();
+            SaveSettings();
+        }
+
+        private static string SettingsPath
+        {
+            get
+            {
+                return Path.Combine(
+                    Path.GetDirectoryName(Application.ExecutablePath),
+                    "settings.ini");
+            }
+        }
+
+        private void LoadSettings()
+        {
+            try
+            {
+                string path = SettingsPath;
+                if (!File.Exists(path)) return;
+
+                foreach (string line in File.ReadAllLines(path))
+                {
+                    int eq = line.IndexOf('=');
+                    if (eq <= 0) continue;
+
+                    string key = line.Substring(0, eq).Trim();
+                    string value = line.Substring(eq + 1).Trim();
+
+                    if (string.Equals(key, "Layout", StringComparison.OrdinalIgnoreCase))
+                        verticalLayout = string.Equals(value, "Vertical", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { }
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                string path = SettingsPath;
+                string dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
+                File.WriteAllText(path,
+                    "Layout=" + (verticalLayout ? "Vertical" : "Horizontal") + "\r\n");
+            }
+            catch { }
+        }
+
+        private void SyncLayoutTexts()
+        {
+            string text = LayoutMenuText(verticalLayout);
+            foreach (ToolStripMenuItem item in layoutItems) item.Text = text;
+        }
+
+        private ToolStripMenuItem BuildStartupMenu()
+        {
+            ToolStripMenuItem item = new ToolStripMenuItem("Démarrer avec Windows");
+            item.Checked = IsStartupEnabled;
+            item.Click += delegate { ToggleStartup(); };
+            startupItems.Add(item);
+            return item;
+        }
+
+        private void ToggleStartup()
+        {
+            bool enable = !IsStartupEnabled;
+            try
+            {
+                SetStartupEnabled(enable);
+            }
+            catch (Exception ex)
+            {
+                string message = "Impossible de modifier le démarrage automatique :\n" + ex.Message;
+                if (Visible)
+                    MessageBox.Show(this, message, "PerfWidget", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                else
+                    MessageBox.Show(message, "PerfWidget", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+
+            SyncStartupChecks();
+        }
+
+        private void SyncStartupChecks()
+        {
+            bool enabled = IsStartupEnabled;
+            foreach (ToolStripMenuItem item in startupItems) item.Checked = enabled;
+        }
+
+        private static string StartupShortcutPath
+        {
+            get
+            {
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Startup),
+                    "PerfWidget.lnk");
+            }
+        }
+
+        private static bool IsStartupEnabled
+        {
+            get
+            {
+                try
+                {
+                    string shortcut = StartupShortcutPath;
+                    if (!File.Exists(shortcut)) return false;
+
+                    object shell = CreateShell();
+                    object link = null;
+                    try
+                    {
+                        link = OpenShortcut(shell, shortcut);
+                        string target = GetShortcutProperty(link, "TargetPath") as string;
+                        return target != null &&
+                            string.Equals(Path.GetFullPath(target),
+                                Path.GetFullPath(Application.ExecutablePath),
+                                StringComparison.OrdinalIgnoreCase);
+                    }
+                    finally
+                    {
+                        ReleaseComObject(link);
+                        ReleaseComObject(shell);
+                    }
+                }
+                catch
+                {
+                    return false;
+                }
+            }
+        }
+
+        private static void SetStartupEnabled(bool enable)
+        {
+            string shortcut = StartupShortcutPath;
+
+            if (!enable)
+            {
+                if (File.Exists(shortcut)) File.Delete(shortcut);
+                return;
+            }
+
+            string exe = Application.ExecutablePath;
+            object shell = CreateShell();
+            object link = null;
+            try
+            {
+                link = OpenShortcut(shell, shortcut);
+                SetShortcutProperty(link, "TargetPath", exe);
+                SetShortcutProperty(link, "WorkingDirectory", Path.GetDirectoryName(exe));
+                SetShortcutProperty(link, "Description", "Moniteur de performance");
+                SetShortcutProperty(link, "IconLocation", exe + ",0");
+                SetShortcutProperty(link, "WindowStyle", 1);
+                link.GetType().InvokeMember("Save", BindingFlags.InvokeMethod, null, link, null);
+            }
+            finally
+            {
+                ReleaseComObject(link);
+                ReleaseComObject(shell);
+            }
+        }
+
+        private static object CreateShell()
+        {
+            Type shellType = Type.GetTypeFromProgID("WScript.Shell");
+            if (shellType == null)
+                throw new InvalidOperationException("WScript.Shell est introuvable sur ce système.");
+            return Activator.CreateInstance(shellType);
+        }
+
+        private static object OpenShortcut(object shell, string path)
+        {
+            return shell.GetType().InvokeMember("CreateShortcut", BindingFlags.InvokeMethod,
+                null, shell, new object[] { path });
+        }
+
+        private static object GetShortcutProperty(object link, string name)
+        {
+            try
+            {
+                return link.GetType().InvokeMember(name, BindingFlags.GetProperty, null, link, null);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private static void SetShortcutProperty(object link, string name, object value)
+        {
+            link.GetType().InvokeMember(name, BindingFlags.SetProperty, null, link, new[] { value });
+        }
+
+        private static void ReleaseComObject(object comObject)
+        {
+            try
+            {
+                if (comObject != null && Marshal.IsComObject(comObject))
+                    Marshal.ReleaseComObject(comObject);
+            }
+            catch { }
+        }
+
+        private void ApplyLayout()
+        {
+            int w = (int)(LogicalW * scale);
+            int h = (int)(LogicalH * scale);
+
+            Size = new Size(w, h);
+            Location = ClampToWorkingArea(Location);
+
+            RefreshValues();
+            Render();
+        }
+
+        private Point ClampToWorkingArea(Point location)
+        {
+            Rectangle work = Screen.FromRectangle(new Rectangle(location, Size)).WorkingArea;
+
+            int maxX = Math.Max(work.Left, work.Right - Width);
+            int maxY = Math.Max(work.Top, work.Bottom - Height);
+
+            return new Point(
+                Math.Min(Math.Max(location.X, work.Left), maxX),
+                Math.Min(Math.Max(location.Y, work.Top), maxY));
+        }
+
+        private void OnDisplaySettingsChanged(object sender, EventArgs e)
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+
+            try
+            {
+                BeginInvoke(new MethodInvoker(delegate
+                {
+                    Location = ClampToWorkingArea(Location);
+                }));
+            }
+            catch (InvalidOperationException) { }
         }
 
         private void BuildTrayIcon()
@@ -231,9 +578,14 @@ namespace PerfWidget
             trayMenu.Items.Add("Afficher", null, delegate { ShowWidget(); });
             trayMenu.Items.Add("Minimiser dans la barre d'état", null, delegate { MinimizeToTray(); });
             trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(BuildLayoutItem());
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add(BuildStartupMenu());
+            trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("À propos", null, delegate { ShowAbout(); });
             trayMenu.Items.Add(new ToolStripSeparator());
             trayMenu.Items.Add("Fermer", null, delegate { Application.Exit(); });
+            trayMenu.Opening += delegate { SyncLayoutTexts(); SyncStartupChecks(); };
             trayIcon.ContextMenuStrip = trayMenu;
         }
 
@@ -250,11 +602,14 @@ namespace PerfWidget
 
         private void MinimizeToTray()
         {
+            hiddenByHover = false;
             Visible = false;
         }
 
         private void ShowWidget()
         {
+            hiddenByHover = false;
+            Location = ClampToWorkingArea(Location);
             Visible = true;
             Activate();
         }
@@ -280,6 +635,22 @@ namespace PerfWidget
                     : -1f;
             }
             catch { diskVal = -1f; }
+
+            try
+            {
+                PowerStatus ps = SystemInformation.PowerStatus;
+                batteryOnAC = ps.PowerLineStatus == PowerLineStatus.Online;
+                batteryPct = ps.BatteryLifePercent >= 0f && ps.BatteryLifePercent <= 1f
+                    ? Clamp(ps.BatteryLifePercent * 100f)
+                    : -1f;
+                batterySeconds = ps.BatteryLifeRemaining;
+            }
+            catch
+            {
+                batteryOnAC = false;
+                batteryPct = -1f;
+                batterySeconds = -1;
+            }
         }
 
         private static float Read(PerformanceCounter pc)
@@ -294,6 +665,24 @@ namespace PerfWidget
             if (v < 0f) return 0f;
             if (v > 100f) return 100f;
             return v;
+        }
+
+        private static string FormatPercent(float v)
+        {
+            return v < 0f ? "--" : ((int)Math.Round(v)).ToString() + "%";
+        }
+
+        private string FormatBatteryText()
+        {
+            if (batteryOnAC) return "AC";
+            if (batterySeconds <= 0) return "--";
+
+            TimeSpan t = TimeSpan.FromSeconds(batterySeconds);
+            if (t.TotalHours >= 1.0)
+                return string.Format("{0}h{1:00}", (int)t.TotalHours, t.Minutes);
+
+            int mins = (int)Math.Ceiling(t.TotalMinutes);
+            return mins.ToString() + "m";
         }
 
         private void Render()
@@ -351,15 +740,18 @@ namespace PerfWidget
 
         private void Draw(Graphics g)
         {
+            float panelW = PanelWidth;
+            float panelH = PanelHeight;
+
             // Drop shadow
-            RectangleF shadow = new RectangleF(4f, 4f, 296f, 28f);
-            using (GraphicsPath sp = Rounded(shadow, 14f))
+            RectangleF shadow = new RectangleF(ShadowGap, ShadowGap, panelW, panelH);
+            using (GraphicsPath sp = Rounded(shadow, CornerRadius))
             using (SolidBrush sb = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
                 g.FillPath(sb, sp);
 
             // Panel
-            RectangleF panel = new RectangleF(0f, 0f, 296f, 28f);
-            using (GraphicsPath pp = Rounded(panel, 14f))
+            RectangleF panel = new RectangleF(0f, 0f, panelW, panelH);
+            using (GraphicsPath pp = Rounded(panel, CornerRadius))
             {
                 using (LinearGradientBrush bg = new LinearGradientBrush(panel,
                     Color.FromArgb(45, 46, 66), Color.FromArgb(28, 29, 42), 90f))
@@ -369,28 +761,38 @@ namespace PerfWidget
                     g.DrawPath(border, pp);
             }
 
-            DrawSegment(g, "CPU", cpuVal, 0);
-            DrawSegment(g, "RAM", ramVal, 1);
-            DrawSegment(g, "DISK", diskVal, 2);
+            DrawSegment(g, "CPU", cpuVal, FormatPercent(cpuVal), 0);
+            DrawSegment(g, "RAM", ramVal, FormatPercent(ramVal), 1);
+            DrawSegment(g, "DISK", diskVal, FormatPercent(diskVal), 2);
+            DrawSegment(g, "BAT", batteryPct, FormatBatteryText(), 3);
         }
 
-        private void DrawSegment(Graphics g, string label, float val, int index)
+        private void DrawSegment(Graphics g, string label, float val, string text, int index)
         {
-            const float panelW = 296f;
-            const float panelH = 28f;
-            float colW = panelW / 3f;
-            float x = index * colW;
+            float panelW = PanelWidth;
+            float panelH = PanelHeight;
+
+            RectangleF cell = verticalLayout
+                ? new RectangleF(0f, index * (panelH / 4f), panelW, panelH / 4f)
+                : new RectangleF(index * (panelW / 4f), 0f, panelW / 4f, panelH);
 
             // Separator
             if (index > 0)
             {
                 using (Pen sep = new Pen(Color.FromArgb(60, 61, 82), 1f))
-                    g.DrawLine(sep, x, 9f, x, panelH - 9f);
+                {
+                    if (verticalLayout)
+                        g.DrawLine(sep, 9f, cell.Y, panelW - 9f, cell.Y);
+                    else
+                        g.DrawLine(sep, cell.X, 9f, cell.X, panelH - 9f);
+                }
             }
+
+            float midY = cell.Y + cell.Height / 2f;
 
             // Status indicator
             Color c = val >= 0f ? BarColor(val) : Color.FromArgb(90, 92, 118);
-            using (GraphicsPath ip = Rounded(new RectangleF(x + 12f, 8f, 6f, 12f), 3f))
+            using (GraphicsPath ip = Rounded(new RectangleF(cell.X + 12f, midY - 6f, 6f, 12f), 3f))
             using (SolidBrush ib = new SolidBrush(c))
                 g.FillPath(ib, ip);
 
@@ -399,18 +801,19 @@ namespace PerfWidget
             using (StringFormat sf = new StringFormat())
             {
                 sf.LineAlignment = StringAlignment.Center;
-                g.DrawString(label, labelFont, lb, new RectangleF(x + 24f, 0f, 34f, panelH), sf);
+                g.DrawString(label, labelFont, lb,
+                    new RectangleF(cell.X + 24f, cell.Y, 34f, cell.Height), sf);
             }
 
             // Value
-            string txt = val < 0f ? "--" : ((int)Math.Round(val)).ToString() + "%";
             using (StringFormat sf = new StringFormat())
             {
                 sf.Alignment = StringAlignment.Far;
                 sf.LineAlignment = StringAlignment.Center;
+                sf.FormatFlags = StringFormatFlags.NoWrap;
                 using (SolidBrush vb = new SolidBrush(val >= 0f ? Color.White : Color.FromArgb(158, 159, 178)))
-                    g.DrawString(txt, valueFont, vb,
-                        new RectangleF(x + colW - 40f, 0f, 30f, panelH), sf);
+                    g.DrawString(text, valueFont, vb,
+                        new RectangleF(cell.Right - 58f, cell.Y, 48f, cell.Height), sf);
             }
         }
 

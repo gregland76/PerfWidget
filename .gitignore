@@ -1,2 +1,5 @@
 # Build output
 PerfWidget.exe
+
+# Runtime settings
+settings.ini
