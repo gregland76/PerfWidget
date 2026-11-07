@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -67,13 +68,19 @@ namespace PerfWidget
     public class PerfWidget : Form
     {
         private const int HorizontalPanelW = 396;
-        private const int HorizontalPanelH = 28;
-        private const int VerticalPanelW = 140;
-        private const int VerticalPanelH = 104;
+        private const int VerticalPanelW = 200;
+        private const int HorizontalMetricsH = 28;
+        private const int VerticalMetricsH = 104;
+        private const int AppRowCount = 2;
+        private const int AppRowH = 22;
+        private const int AppSampleIntervalMs = 2000;
         private const int ShadowGap = 4;
         private const float CornerRadius = 14f;
         private const int HoverPollInterval = 60;
         private const int HoverReleaseMargin = 12;
+        private const int MinOpacity = 20;
+        private const int MaxOpacity = 100;
+        private const int DefaultOpacity = 82;
 
         private static readonly Color Green = Color.FromArgb(61, 220, 132);
         private static readonly Color Amber = Color.FromArgb(255, 193, 7);
@@ -96,10 +103,21 @@ namespace PerfWidget
         private Font labelFont;
         private Font valueFont;
 
+        private readonly Dictionary<string, AppSample> previousApps =
+            new Dictionary<string, AppSample>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, float> appEnergy =
+            new Dictionary<string, float>(StringComparer.OrdinalIgnoreCase);
+        private readonly string[] topAppNames = new string[AppRowCount];
+        private readonly float[] topAppCpu = new float[AppRowCount];
+        private readonly long[] topAppMemory = new long[AppRowCount];
+        private long lastAppSample;
+        private bool promptOpen;
+
         private bool dragging;
         private Point dragOffset;
 
         private bool verticalLayout;
+        private int windowOpacity = DefaultOpacity;
         private readonly System.Collections.Generic.List<ToolStripMenuItem> layoutItems =
             new System.Collections.Generic.List<ToolStripMenuItem>();
         private readonly System.Collections.Generic.List<ToolStripMenuItem> startupItems =
@@ -113,7 +131,8 @@ namespace PerfWidget
         }
 
         private int PanelWidth { get { return verticalLayout ? VerticalPanelW : HorizontalPanelW; } }
-        private int PanelHeight { get { return verticalLayout ? VerticalPanelH : HorizontalPanelH; } }
+        private int MetricsHeight { get { return verticalLayout ? VerticalMetricsH : HorizontalMetricsH; } }
+        private int PanelHeight { get { return MetricsHeight + AppRowH * AppRowCount; } }
         private int LogicalW { get { return PanelWidth + ShadowGap; } }
         private int LogicalH { get { return PanelHeight + ShadowGap; } }
 
@@ -189,11 +208,17 @@ namespace PerfWidget
         protected override void OnMouseDown(MouseEventArgs e)
         {
             base.OnMouseDown(e);
-            if (e.Button == MouseButtons.Left && CtrlDown)
+            if (e.Button != MouseButtons.Left || !CtrlDown) return;
+
+            int row = AppRowAt(e.Location);
+            if (row >= 0)
             {
-                dragging = true;
-                dragOffset = e.Location;
+                AskCloseApp(row);
+                return;
             }
+
+            dragging = true;
+            dragOffset = e.Location;
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -283,7 +308,7 @@ namespace PerfWidget
                 return;
             }
 
-            if (dragging || CtrlDown) return;
+            if (promptOpen || dragging || CtrlDown) return;
 
             if (Bounds.Contains(cursor))
             {
@@ -348,7 +373,15 @@ namespace PerfWidget
                     string value = line.Substring(eq + 1).Trim();
 
                     if (string.Equals(key, "Layout", StringComparison.OrdinalIgnoreCase))
+                    {
                         verticalLayout = string.Equals(value, "Vertical", StringComparison.OrdinalIgnoreCase);
+                    }
+                    else if (string.Equals(key, "Opacity", StringComparison.OrdinalIgnoreCase))
+                    {
+                        int parsed;
+                        if (int.TryParse(value, out parsed))
+                            windowOpacity = Math.Min(MaxOpacity, Math.Max(MinOpacity, parsed));
+                    }
                 }
             }
             catch { }
@@ -364,7 +397,8 @@ namespace PerfWidget
                     Directory.CreateDirectory(dir);
 
                 File.WriteAllText(path,
-                    "Layout=" + (verticalLayout ? "Vertical" : "Horizontal") + "\r\n");
+                    "Layout=" + (verticalLayout ? "Vertical" : "Horizontal") + "\r\n" +
+                    "Opacity=" + windowOpacity + "\r\n");
             }
             catch { }
         }
@@ -651,6 +685,8 @@ namespace PerfWidget
                 batteryPct = -1f;
                 batterySeconds = -1;
             }
+
+            RefreshApps();
         }
 
         private static float Read(PerformanceCounter pc)
@@ -683,6 +719,252 @@ namespace PerfWidget
 
             int mins = (int)Math.Ceiling(t.TotalMinutes);
             return mins.ToString() + "m";
+        }
+
+        private sealed class AppSample
+        {
+            public long CpuTicks;
+            public long Memory;
+        }
+
+        // Energy is not exposed per application by Windows without an elevated ETW
+        // session, so CPU time is used as the estimation basis. Processes from the
+        // system session and shell/system processes are never listed or closed.
+        private static readonly HashSet<string> ProtectedProcesses =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+            {
+                "system", "idle", "registry", "memory compression", "secure system",
+                "csrss", "smss", "wininit", "winlogon", "services", "lsass", "lsaiso",
+                "svchost", "explorer", "dwm", "fontdrvhost", "ctfmon", "sihost",
+                "taskhostw", "runtimebroker", "searchindexer", "applicationframehost",
+                "perfwidget"
+            };
+
+        private void RefreshApps()
+        {
+            long now = Stopwatch.GetTimestamp();
+            if (lastAppSample != 0 &&
+                (now - lastAppSample) * 1000.0 / Stopwatch.Frequency < AppSampleIntervalMs)
+                return;
+
+            SampleTopApps(now);
+        }
+
+        private void SampleTopApps(long now)
+        {
+            double seconds = lastAppSample == 0
+                ? 0.0
+                : (now - lastAppSample) / (double)Stopwatch.Frequency;
+            lastAppSample = now;
+
+            Process[] processes;
+            try { processes = Process.GetProcesses(); }
+            catch { return; }
+
+            int selfPid;
+            int sessionId;
+            using (Process self = Process.GetCurrentProcess())
+            {
+                selfPid = self.Id;
+                sessionId = self.SessionId;
+            }
+
+            Dictionary<string, AppSample> current =
+                new Dictionary<string, AppSample>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (Process p in processes)
+            {
+                try
+                {
+                    if (p.Id == selfPid || p.SessionId != sessionId) continue;
+                    if (ProtectedProcesses.Contains(p.ProcessName)) continue;
+
+                    long ticks;
+                    try { ticks = p.TotalProcessorTime.Ticks; }
+                    catch { continue; }
+
+                    long memory = 0;
+                    try { memory = p.WorkingSet64; }
+                    catch { }
+
+                    AppSample sample;
+                    if (!current.TryGetValue(p.ProcessName, out sample))
+                    {
+                        sample = new AppSample();
+                        current[p.ProcessName] = sample;
+                    }
+                    sample.CpuTicks += ticks;
+                    sample.Memory += memory;
+                }
+                catch { }
+                finally { p.Dispose(); }
+            }
+
+            // Processor time available to every process during the window, in ticks.
+            double capacity = seconds * Environment.ProcessorCount * TimeSpan.TicksPerSecond;
+
+            foreach (KeyValuePair<string, AppSample> pair in current)
+            {
+                float raw = 0f;
+                AppSample previous;
+                if (capacity > 0.0 && previousApps.TryGetValue(pair.Key, out previous))
+                {
+                    long delta = pair.Value.CpuTicks - previous.CpuTicks;
+                    if (delta > 0)
+                        raw = (float)Math.Min(100.0, delta / capacity * 100.0);
+                }
+
+                float smoothed;
+                if (appEnergy.TryGetValue(pair.Key, out smoothed))
+                    smoothed = smoothed * 0.5f + raw * 0.5f;
+                else
+                    smoothed = raw;
+
+                appEnergy[pair.Key] = smoothed;
+            }
+
+            List<string> vanished = new List<string>();
+            foreach (string known in appEnergy.Keys)
+                if (!current.ContainsKey(known)) vanished.Add(known);
+            foreach (string gone in vanished) appEnergy.Remove(gone);
+
+            previousApps.Clear();
+            foreach (KeyValuePair<string, AppSample> pair in current)
+                previousApps[pair.Key] = pair.Value;
+
+            List<KeyValuePair<string, float>> ranked = new List<KeyValuePair<string, float>>(appEnergy);
+            ranked.Sort(delegate(KeyValuePair<string, float> a, KeyValuePair<string, float> b)
+            {
+                return b.Value.CompareTo(a.Value);
+            });
+
+            for (int i = 0; i < AppRowCount; i++)
+            {
+                if (i < ranked.Count && ranked[i].Value > 0.05f)
+                {
+                    topAppNames[i] = ranked[i].Key;
+                    topAppCpu[i] = ranked[i].Value;
+                    topAppMemory[i] = current[ranked[i].Key].Memory;
+                }
+                else
+                {
+                    topAppNames[i] = null;
+                    topAppCpu[i] = 0f;
+                    topAppMemory[i] = 0L;
+                }
+            }
+        }
+
+        private static string FormatMemory(long bytes)
+        {
+            if (bytes <= 0) return "--";
+            return (bytes / (1024 * 1024)).ToString("N0") + " Mo";
+        }
+
+        private static string Trim(Graphics g, string text, Font font, float maxWidth)
+        {
+            if (string.IsNullOrEmpty(text) || maxWidth <= 0f) return string.Empty;
+            if (g.MeasureString(text, font).Width <= maxWidth) return text;
+
+            for (int length = text.Length - 1; length > 0; length--)
+            {
+                string candidate = text.Substring(0, length) + "...";
+                if (g.MeasureString(candidate, font).Width <= maxWidth) return candidate;
+            }
+            return "...";
+        }
+
+        private void AskCloseApp(int index)
+        {
+            string name = topAppNames[index];
+            if (string.IsNullOrEmpty(name)) return;
+
+            DialogResult answer;
+            promptOpen = true;
+            try
+            {
+                answer = MessageBox.Show(this,
+                    "Demander la fermeture de « " + name + " » ?",
+                    "PerfWidget",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2);
+            }
+            finally
+            {
+                promptOpen = false;
+            }
+
+            if (answer != DialogResult.Yes) return;
+
+            string processName = name;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                TerminateApplications(processName);
+            });
+        }
+
+        private static void TerminateApplications(string processName)
+        {
+            int selfPid;
+            int sessionId;
+            using (Process self = Process.GetCurrentProcess())
+            {
+                selfPid = self.Id;
+                sessionId = self.SessionId;
+            }
+
+            Process[] found;
+            try { found = Process.GetProcessesByName(processName); }
+            catch { return; }
+
+            List<Process> pending = new List<Process>();
+            foreach (Process p in found)
+            {
+                bool asked = false;
+                try
+                {
+                    if (p.Id != selfPid && p.SessionId == sessionId)
+                    {
+                        if (p.MainWindowHandle != IntPtr.Zero)
+                        {
+                            p.CloseMainWindow();
+                            asked = true;
+                        }
+                        else
+                        {
+                            p.Kill();
+                        }
+                    }
+                }
+                catch { }
+
+                if (asked) pending.Add(p);
+                else p.Dispose();
+            }
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(2);
+            bool alive = pending.Count > 0;
+            while (alive && DateTime.UtcNow < deadline)
+            {
+                System.Threading.Thread.Sleep(100);
+                alive = false;
+                foreach (Process p in pending)
+                {
+                    try
+                    {
+                        if (!p.HasExited) { alive = true; break; }
+                    }
+                    catch { }
+                }
+            }
+
+            foreach (Process p in pending)
+            {
+                try { if (!p.HasExited) p.Kill(); }
+                catch { }
+                p.Dispose();
+            }
         }
 
         private void Render()
@@ -742,11 +1024,14 @@ namespace PerfWidget
         {
             float panelW = PanelWidth;
             float panelH = PanelHeight;
+            int alpha = (int)Math.Round(255.0 * windowOpacity / 100.0);
+            int shadowAlpha = (int)Math.Round(70.0 * windowOpacity / 100.0);
+            int borderAlpha = (int)Math.Round(90.0 * windowOpacity / 100.0);
 
             // Drop shadow
             RectangleF shadow = new RectangleF(ShadowGap, ShadowGap, panelW, panelH);
             using (GraphicsPath sp = Rounded(shadow, CornerRadius))
-            using (SolidBrush sb = new SolidBrush(Color.FromArgb(70, 0, 0, 0)))
+            using (SolidBrush sb = new SolidBrush(Color.FromArgb(shadowAlpha, 0, 0, 0)))
                 g.FillPath(sb, sp);
 
             // Panel
@@ -754,27 +1039,97 @@ namespace PerfWidget
             using (GraphicsPath pp = Rounded(panel, CornerRadius))
             {
                 using (LinearGradientBrush bg = new LinearGradientBrush(panel,
-                    Color.FromArgb(45, 46, 66), Color.FromArgb(28, 29, 42), 90f))
+                    Color.FromArgb(alpha, 45, 46, 66), Color.FromArgb(alpha, 28, 29, 42), 90f))
                     g.FillPath(bg, pp);
 
-                using (Pen border = new Pen(Color.FromArgb(90, 92, 118), 1.2f))
+                using (Pen border = new Pen(Color.FromArgb(borderAlpha, 90, 92, 118), 1.2f))
                     g.DrawPath(border, pp);
             }
 
-            DrawSegment(g, "CPU", cpuVal, FormatPercent(cpuVal), 0);
-            DrawSegment(g, "RAM", ramVal, FormatPercent(ramVal), 1);
-            DrawSegment(g, "DISK", diskVal, FormatPercent(diskVal), 2);
-            DrawSegment(g, "BAT", batteryPct, FormatBatteryText(), 3);
+            // The battery is only relevant off power; on AC the tile is dropped
+            // and the remaining metrics share the full width.
+            int segments = batteryOnAC ? 3 : 4;
+            DrawSegment(g, "CPU", cpuVal, FormatPercent(cpuVal), 0, segments);
+            DrawSegment(g, "RAM", ramVal, FormatPercent(ramVal), 1, segments);
+            DrawSegment(g, "DISK", diskVal, FormatPercent(diskVal), 2, segments);
+            if (!batteryOnAC)
+                DrawSegment(g, "BAT", batteryPct, FormatBatteryText(), 3, segments);
+
+            for (int i = 0; i < AppRowCount; i++)
+                DrawAppRow(g, i);
         }
 
-        private void DrawSegment(Graphics g, string label, float val, string text, int index)
+        private RectangleF AppRowRect(int index)
+        {
+            return new RectangleF(0f, MetricsHeight + index * AppRowH, PanelWidth, AppRowH);
+        }
+
+        private int AppRowAt(Point location)
+        {
+            for (int i = 0; i < AppRowCount; i++)
+            {
+                RectangleF row = AppRowRect(i);
+                RectangleF device = new RectangleF(
+                    row.X * scale, row.Y * scale, row.Width * scale, row.Height * scale);
+                if (device.Contains(location)) return i;
+            }
+            return -1;
+        }
+
+        private void DrawAppRow(Graphics g, int index)
+        {
+            RectangleF row = AppRowRect(index);
+            float panelW = PanelWidth;
+            float midY = row.Y + row.Height / 2f;
+
+            using (Pen sep = new Pen(Color.FromArgb(60, 61, 82), 1f))
+                g.DrawLine(sep, 9f, row.Y, panelW - 9f, row.Y);
+
+            string name = topAppNames[index];
+            bool known = !string.IsNullOrEmpty(name);
+
+            Color indicator = known ? BarColor(topAppCpu[index]) : Color.FromArgb(90, 92, 118);
+            using (GraphicsPath ip = Rounded(new RectangleF(row.X + 12f, midY - 5f, 5f, 10f), 2.5f))
+            using (SolidBrush ib = new SolidBrush(indicator))
+                g.FillPath(ib, ip);
+
+            string resources = known
+                ? FormatPercent(topAppCpu[index]) + "  " + FormatMemory(topAppMemory[index])
+                : "--";
+
+            float resW = g.MeasureString(resources, valueFont).Width;
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.Alignment = StringAlignment.Far;
+                sf.LineAlignment = StringAlignment.Center;
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+                using (SolidBrush rb = new SolidBrush(Color.FromArgb(200, 201, 216)))
+                    g.DrawString(resources, valueFont, rb,
+                        new RectangleF(panelW - 12f - resW, row.Y, resW, row.Height), sf);
+            }
+
+            float nameX = row.X + 24f;
+            float nameW = (panelW - 12f - resW - 10f) - nameX;
+            using (StringFormat sf = new StringFormat())
+            {
+                sf.LineAlignment = StringAlignment.Center;
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+                using (SolidBrush nb = new SolidBrush(known ? Color.White : Color.FromArgb(158, 159, 178)))
+                    g.DrawString(known ? Trim(g, name, labelFont, nameW) : "--", labelFont, nb,
+                        new RectangleF(nameX, row.Y, Math.Max(nameW, 8f), row.Height), sf);
+            }
+        }
+
+        private void DrawSegment(Graphics g, string label, float val, string text, int index, int count)
         {
             float panelW = PanelWidth;
-            float panelH = PanelHeight;
+            float metricsH = MetricsHeight;
+            float cellW = panelW / count;
+            float cellH = metricsH / count;
 
             RectangleF cell = verticalLayout
-                ? new RectangleF(0f, index * (panelH / 4f), panelW, panelH / 4f)
-                : new RectangleF(index * (panelW / 4f), 0f, panelW / 4f, panelH);
+                ? new RectangleF(0f, index * cellH, panelW, cellH)
+                : new RectangleF(index * cellW, 0f, cellW, metricsH);
 
             // Separator
             if (index > 0)
@@ -784,7 +1139,7 @@ namespace PerfWidget
                     if (verticalLayout)
                         g.DrawLine(sep, 9f, cell.Y, panelW - 9f, cell.Y);
                     else
-                        g.DrawLine(sep, cell.X, 9f, cell.X, panelH - 9f);
+                        g.DrawLine(sep, cell.X, 9f, cell.X, metricsH - 9f);
                 }
             }
 

@@ -12,8 +12,16 @@ au premier plan.
 - **CPU** : charge processeur totale (`% Processor Time`)
 - **Mémoire** : `% Committed Bytes In Use`
 - **Disque** : espace utilisé sur `C:`
-- **Batterie** : temps restant estimé (ou `AC` sur secteur)
-- Fenêtre transparente (fenêtre superposée) avec coins arrondis
+- **Batterie** : temps restant estimé ; l'indicateur est **masqué lorsque
+  l'appareil est sur secteur** (les autres métriques se partagent alors toute
+  la largeur)
+- **Applications** : les deux applications qui consomment le plus d'énergie,
+  avec les ressources consommées (CPU % et mémoire). Windows n'expose pas la
+  consommation réelle par application sans session ETW administrateur : le
+  classement s'appuie donc sur le temps processeur consommé, qui en est le
+  principal facteur.
+- Fenêtre transparente (fenêtre superposée) avec coins arrondis ; le niveau de
+  transparence du fond est réglable via `Opacity` dans `settings.ini`
 - Toujours visible (top-most), déplaçable avec **Ctrl + clic gauche**
 - Le widget s'efface dès que la souris le survole, afin de laisser passer les
   clics vers la fenêtre située en dessous ; il réapparaît dès que le pointeur
@@ -21,16 +29,39 @@ au premier plan.
 - Ne peut pas sortir de l'écran : le widget reste toujours entièrement dans la
   zone de travail de l'écran, même après un changement de résolution ou de
   disposition des moniteurs
-- Deux dispositions au choix (données **sur une même ligne** ou **en colonne**,
-  largeur réduite dans ce dernier cas) ; une seule entrée de menu bascule de
+- Deux dispositions au choix (métriques **sur une même ligne** ou **en
+  colonne**, largeur réduite dans ce dernier cas), suivies des deux
+  applications les plus énergivores ; une seule entrée de menu bascule de
   l'une à l'autre (« Passer en disposition en ligne » / « Passer en disposition
   en colonne »)
 - La dernière disposition choisie est mémorisée dans `settings.ini`, à côté de
-  l'exécutable, et restaurée au démarrage
+  l'exécutable, et restaurée au démarrage (voir
+  [Configuration](#configuration-settingsini))
 - Icône dans la barre d'état (notification) avec menu contextuel : afficher,
   minimiser, disposition, démarrage avec Windows, à propos, fermer
 - Démarrage automatique avec Windows, via un raccourci créé dans le dossier
   de démarrage (`shell:startup`), activable depuis le menu de l'icône
+
+## Configuration (`settings.ini`)
+
+Le fichier `settings.ini`, situé à côté de `PerfWidget.exe`, est lu au
+démarrage du widget :
+
+| Clé | Valeurs | Description |
+|-----|---------|-------------|
+| `Layout` | `Horizontal` (défaut) ou `Vertical` | Métriques sur une ligne ou en colonne |
+| `Opacity` | `20` à `100` (défaut `82`) | Opacité du fond, en pourcentage ; plus la valeur est basse, plus la fenêtre est transparente |
+
+Exemple :
+
+```ini
+Layout=Vertical
+Opacity=70
+```
+
+Le widget réécrit ce fichier lorsqu'une disposition est choisie dans le menu de
+l'icône de la barre d'état ; `Opacity` est conservé. Redémarrer le widget après
+une modification manuelle du fichier.
 
 ## Compilation
 
@@ -51,6 +82,10 @@ Lancer `PerfWidget.exe` :
   fenêtre située en dessous. Il réapparaît dès que la souris s'en écarte.
 - **Ctrl enfoncé** : le widget reste affiché et peut être déplacé par un
   **clic gauche maintenu**.
+- **Ctrl + clic sur le nom d'une application** : demande la fermeture de cette
+  application, après confirmation. La fermeture est d'abord polie
+  (`CloseMainWindow`), puis forcée au bout de 2 secondes si l'application ne
+  répond pas. Les processus système et l'horloge ne sont jamais proposés.
 - Le widget n'a pas de menu contextuel : toutes les commandes sont dans le menu
   de l'icône de la barre d'état (clic droit sur l'icône, près de l'horloge).
 - **Menu « Passer en disposition en ligne / en colonne »** (icône) :
