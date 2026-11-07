@@ -13,6 +13,11 @@ au premier plan.
 - **Mémoire** : `% Committed Bytes In Use`
 - **Disque** : espace utilisé sur `C:`
 - **Batterie** : temps restant estimé (ou `AC` sur secteur)
+- **Applications** : les deux applications qui consomment le plus d'énergie,
+  avec les ressources consommées (CPU % et mémoire). Windows n'expose pas la
+  consommation réelle par application sans session ETW administrateur : le
+  classement s'appuie donc sur le temps processeur consommé, qui en est le
+  principal facteur.
 - Fenêtre transparente (fenêtre superposée) avec coins arrondis
 - Toujours visible (top-most), déplaçable avec **Ctrl + clic gauche**
 - Le widget s'efface dès que la souris le survole, afin de laisser passer les
@@ -21,8 +26,9 @@ au premier plan.
 - Ne peut pas sortir de l'écran : le widget reste toujours entièrement dans la
   zone de travail de l'écran, même après un changement de résolution ou de
   disposition des moniteurs
-- Deux dispositions au choix (données **sur une même ligne** ou **en colonne**,
-  largeur réduite dans ce dernier cas) ; une seule entrée de menu bascule de
+- Deux dispositions au choix (métriques **sur une même ligne** ou **en
+  colonne**, largeur réduite dans ce dernier cas), suivies des deux
+  applications les plus énergivores ; une seule entrée de menu bascule de
   l'une à l'autre (« Passer en disposition en ligne » / « Passer en disposition
   en colonne »)
 - La dernière disposition choisie est mémorisée dans `settings.ini`, à côté de
@@ -51,6 +57,10 @@ Lancer `PerfWidget.exe` :
   fenêtre située en dessous. Il réapparaît dès que la souris s'en écarte.
 - **Ctrl enfoncé** : le widget reste affiché et peut être déplacé par un
   **clic gauche maintenu**.
+- **Ctrl + clic sur le nom d'une application** : demande la fermeture de cette
+  application, après confirmation. La fermeture est d'abord polie
+  (`CloseMainWindow`), puis forcée au bout de 2 secondes si l'application ne
+  répond pas. Les processus système et l'horloge ne sont jamais proposés.
 - Le widget n'a pas de menu contextuel : toutes les commandes sont dans le menu
   de l'icône de la barre d'état (clic droit sur l'icône, près de l'horloge).
 - **Menu « Passer en disposition en ligne / en colonne »** (icône) :
