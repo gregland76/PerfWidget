@@ -67,10 +67,9 @@ namespace PerfWidget
 
     public class PerfWidget : Form
     {
-        private const int HorizontalPanelW = 396;
+        private const int HorizontalMetricsColW = 100;
         private const int VerticalPanelW = 200;
         private const int HorizontalMetricsH = 28;
-        private const int VerticalMetricsH = 104;
         private const int AppRowCount = 2;
         private const int AppRowH = 22;
         private const int AppSampleIntervalMs = 2000;
@@ -130,8 +129,9 @@ namespace PerfWidget
                 : "Passer en disposition en colonne";
         }
 
-        private int PanelWidth { get { return verticalLayout ? VerticalPanelW : HorizontalPanelW; } }
-        private int MetricsHeight { get { return verticalLayout ? VerticalMetricsH : HorizontalMetricsH; } }
+        private int PanelWidth { get { return verticalLayout ? VerticalPanelW : HorizontalMetricsColW * SegmentCount; } }
+        private int MetricsHeight { get { return verticalLayout ? AppRowH * SegmentCount : HorizontalMetricsH; } }
+        private int SegmentCount { get { return batteryOnAC ? 3 : 4; } }
         private int PanelHeight { get { return MetricsHeight + AppRowH * AppRowCount; } }
         private int LogicalW { get { return PanelWidth + ShadowGap; } }
         private int LogicalH { get { return PanelHeight + ShadowGap; } }
@@ -176,13 +176,11 @@ namespace PerfWidget
             timer.Tick += delegate
             {
                 if (!Visible) return;
-                RefreshValues();
-                Render();
+                RefreshAndRender();
             };
             timer.Start();
 
-            RefreshValues();
-            Render();
+            RefreshAndRender();
         }
 
         protected override CreateParams CreateParams
@@ -303,8 +301,7 @@ namespace PerfWidget
 
                 hiddenByHover = false;
                 Visible = true;
-                RefreshValues();
-                Render();
+                RefreshAndRender();
                 return;
             }
 
@@ -652,6 +649,16 @@ namespace PerfWidget
         {
             if (Visible) MinimizeToTray();
             else ShowWidget();
+        }
+
+        private void RefreshAndRender()
+        {
+            int segments = SegmentCount;
+            RefreshValues();
+            if (SegmentCount != segments)
+                ApplyLayout();
+            else
+                Render();
         }
 
         private void RefreshValues()
@@ -1048,7 +1055,7 @@ namespace PerfWidget
 
             // The battery is only relevant off power; on AC the tile is dropped
             // and the remaining metrics share the full width.
-            int segments = batteryOnAC ? 3 : 4;
+            int segments = SegmentCount;
             DrawSegment(g, "CPU", cpuVal, FormatPercent(cpuVal), 0, segments);
             DrawSegment(g, "RAM", ramVal, FormatPercent(ramVal), 1, segments);
             DrawSegment(g, "DISK", diskVal, FormatPercent(diskVal), 2, segments);
